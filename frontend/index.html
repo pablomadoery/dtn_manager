@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DTN-Manager</title>
+    <meta name="description" content="Interactive DTN topology management with Docker-backed ION nodes">
+    <link rel="stylesheet" href="/static/css/style.css?v=2">
+    <script src="https://unpkg.com/cytoscape@3.30.4/dist/cytoscape.min.js"></script>
+</head>
+<body>
+
+    <div id="app">
+        <!-- Header -->
+        <header id="app-header">
+            <div class="header-left">
+                <h1>⬡ DTN-Manager</h1>
+            </div>
+            <div class="header-right">
+                <span id="node-count" class="header-stat">0 nodes</span>
+                <span id="link-count" class="header-stat">0 links</span>
+            </div>
+        </header>
+
+        <!-- Main horizontal split: [left | graph | right] -->
+        <div id="main-area">
+            <!-- Left sidebar -->
+            <div id="left-sidebar" class="sidebar-panel">
+                <div class="panel">
+                    <h2>Topology</h2>
+                    <div class="toolbar-grid">
+                        <button id="btn-add-node" class="toolbar-btn">
+                            <span class="toolbar-icon node-icon">N</span>
+                            <span>Add Node</span>
+                        </button>
+                        <button id="btn-link-mode" class="toolbar-btn">
+                            <span class="toolbar-icon link-icon">⟷</span>
+                            <span>Add Link</span>
+                        </button>
+                    </div>
+                </div>
+                <div class="panel">
+                    <h2>Layout</h2>
+                    <div class="toolbar-grid" style="grid-template-columns: 1fr 1fr 1fr">
+                        <button id="btn-fit" class="toolbar-btn">
+                            <span class="toolbar-icon">⊡</span>
+                            <span>Fit</span>
+                        </button>
+                        <button id="btn-circle-layout" class="toolbar-btn">
+                            <span class="toolbar-icon" style="color:#bc8cff">◎</span>
+                            <span>Circle</span>
+                        </button>
+                        <button id="btn-toggle-stats" class="toolbar-btn">
+                            <span class="toolbar-icon" style="color:#d29922">📊</span>
+                            <span>Stats</span>
+                        </button>
+                    </div>
+                </div>
+                <div class="panel">
+                    <h2>Static Routing</h2>
+                    <div class="toolbar-grid">
+                        <button id="btn-set-exits" class="toolbar-btn">
+                            <span class="toolbar-icon" style="color:#3fb950">⇉</span>
+                            <span>Set All Exits</span>
+                        </button>
+                        <button id="btn-clear-exits" class="toolbar-btn">
+                            <span class="toolbar-icon" style="color:#f85149">⇏</span>
+                            <span>Clear All Exits</span>
+                        </button>
+                    </div>
+                </div>
+                <div class="panel">
+                    <h2>Traffic</h2>
+                    <div class="input-row">
+                        <label class="input-label">Source</label>
+                        <select id="traffic-from" class="input-full">
+                            <option value="">— select —</option>
+                        </select>
+                    </div>
+                    <div class="input-row">
+                        <label class="input-label">Destination</label>
+                        <select id="traffic-to" class="input-full">
+                            <option value="">— select —</option>
+                        </select>
+                    </div>
+                    <div class="input-row">
+                        <label class="input-label">Content</label>
+                        <input type="text" id="traffic-msg" class="input-full"
+                               placeholder="Bundle payload" value="hello">
+                    </div>
+                    <div class="input-row">
+                        <label class="input-label">Count</label>
+                        <input type="number" id="traffic-count" class="input-full"
+                               value="1" min="1" max="100">
+                    </div>
+                    <button id="btn-send" class="btn btn-accent" style="width:100%;margin-top:6px">▶ Send Bundles</button>
+                </div>
+                <div class="panel">
+                    <h2>Scenario</h2>
+                    <div class="toolbar-grid">
+                        <button id="btn-export" class="toolbar-btn">
+                            <span class="toolbar-icon" style="color:#58a6ff">↥</span>
+                            <span>Export</span>
+                        </button>
+                        <button id="btn-import" class="toolbar-btn">
+                            <span class="toolbar-icon" style="color:#d29922">↧</span>
+                            <span>Import</span>
+                        </button>
+                        <button id="btn-export-bundle" class="toolbar-btn" style="grid-column: span 2">
+                            <span class="toolbar-icon" style="color:#3fb950">📦</span>
+                            <span>Export Zip</span>
+                        </button>
+                    </div>
+                    <input type="file" id="import-file-input" accept=".json" style="display:none">
+                    <button id="btn-cleanup" class="btn btn-danger btn-sm" style="width:100%;margin-top:8px">Clear All</button>
+                </div>
+            </div>
+
+            <!-- Resize handle: left ↔ graph -->
+            <div class="resize-handle resize-h" data-resize="left"></div>
+
+            <!-- Center: graph + bottom terminals -->
+            <div id="center-area">
+                <!-- Graph panel -->
+                <div id="graph-panel">
+                    <div id="loading-overlay" class="loading-overlay hidden">
+                        <div class="loading-card">
+                            <div class="loading-spinner"></div>
+                            <div id="loading-message" class="loading-message">Working...</div>
+                            <div id="loading-detail" class="loading-detail"></div>
+                        </div>
+                    </div>
+                    <div id="cy"></div>
+                    <div id="mode-banner" class="hidden">
+                        <span id="mode-text">Link mode: click first node</span>
+                        <button id="btn-cancel-mode" class="btn btn-sm">✕ Cancel</button>
+                    </div>
+                    <div id="node-stats-layer" class="node-stats-layer"></div>
+                </div>
+
+                <!-- Resize handle: graph ↔ terminals -->
+                <div class="resize-handle resize-v" data-resize="bottom"></div>
+
+                <!-- Bottom terminal bar -->
+                <div id="terminal-bar">
+                    <div id="terminal-tabs">
+                        <span class="terminal-tabs-label">Terminals</span>
+                    </div>
+                    <div id="terminal-panels"></div>
+                </div>
+            </div>
+
+            <!-- Resize handle: graph ↔ right -->
+            <div class="resize-handle resize-h" data-resize="right"></div>
+
+            <!-- Right sidebar -->
+            <div id="right-sidebar" class="sidebar-panel">
+                <div class="panel" id="inspector-panel">
+                    <h2>Inspector</h2>
+                    <div id="inspector-content">
+                        <p class="placeholder-text">Click a node or link to inspect</p>
+                    </div>
+                </div>
+                <div class="panel" id="node-list-panel">
+                    <h2>Node List</h2>
+                    <div id="node-list"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast-container"></div>
+    <div id="ctx-menu-container"></div>
+    <script src="/static/js/app.js?v=15"></script>
+</body>
+</html>

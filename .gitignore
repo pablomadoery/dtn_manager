@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Runtime / logs
+*.log
+.ionmgr.log
+.ionmgr.pid
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker runtime
+*.tar
+
+# Exported scenarios (runtime artifacts)
+scenarios/
