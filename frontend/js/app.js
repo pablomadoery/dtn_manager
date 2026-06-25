@@ -33,6 +33,19 @@
     let statsTimer = null;
     let statsVisible = true;
 
+    // Server-truth reconciliation: the backend stamps every topology with a
+    // monotonic epoch and a per-process boot_id. When either changes we flush
+    // stale bundleStats so badges can't survive a node-id reuse or a restart.
+    let serverEpoch = null;
+    let serverBootId = null;
+
+    // Connection health, driven by both the poll loop and the topology socket.
+    let connectionState = 'connecting';   // connecting | connected | disconnected
+    let consecutiveFailures = 0;
+
+    // Single in-flight mutation lock (anti double-submit across all actions).
+    let mutationInFlight = false;
+
     // ═══════════════════════════════════════════════════════════
     //  LOADING OVERLAY
     // ═══════════════════════════════════════════════════════════
@@ -59,39 +72,144 @@
     //  API HELPERS
     // ═══════════════════════════════════════════════════════════
 
+    // One fetch chokepoint: read the body as text first, parse JSON defensively,
+    // and check res.ok BEFORE trusting the parse — so a non-JSON error body
+    // (a 502/504 HTML page, a crash) surfaces the real status instead of the
+    // misleading "Unexpected token <" SyntaxError that used to hide the 409.
+    async function apiFetch(url, opts = {}) {
+        let res;
+        try {
+            res = await fetch(url, opts);
+        } catch (e) {
+            throw new Error(`Network error: ${e.message || 'request failed'}`);
+        }
+        const raw = await res.text();
+        let data = null;
+        if (raw) {
+            try { data = JSON.parse(raw); } catch (e) { data = null; }
+        }
+        if (!res.ok) {
+            const detail = (data && data.detail) ||
+                (raw && raw.slice(0, 200)) ||
+                `${res.status} ${res.statusText}`;
+            throw new Error(detail);
+        }
+        return data;
+    }
+
     async function apiPost(url, body = {}) {
-        const res = await fetch(url, {
+        return apiFetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || 'Request failed');
-        return data;
     }
 
     async function apiDelete(url) {
-        const res = await fetch(url, { method: 'DELETE' });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || 'Request failed');
-        return data;
+        return apiFetch(url, { method: 'DELETE' });
+    }
+
+    // Single in-flight mutation gate. Every mutating action funnels through
+    // this so a double-click cannot fire two creates and spawn duplicate
+    // resources. On any failure we force an immediate resync from server truth.
+    async function runMutation(fn) {
+        if (mutationInFlight) {
+            toast('Another operation is in progress…', 'info');
+            return;
+        }
+        mutationInFlight = true;
+        try {
+            return await fn();
+        } catch (e) {
+            toast(e.message || 'Operation failed', 'error');
+            // Reconcile UI to whatever the server actually has.
+            try { await fetchTopology(); } catch (_) {}
+        } finally {
+            mutationInFlight = false;
+            hideLoading();
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  CONNECTION STATE
+    // ═══════════════════════════════════════════════════════════
+
+    function setConnectionState(state) {
+        if (state === connectionState) return;
+        connectionState = state;
+        const dot = document.getElementById('conn-indicator');
+        if (dot) {
+            const colors = { connected: '#3fb950', connecting: '#d29922',
+                             disconnected: '#f85149' };
+            dot.style.background = colors[state] || '#888';
+            dot.title = `Server: ${state}`;
+        }
+        if (state === 'disconnected') {
+            toast('Lost connection to server — retrying…', 'error');
+        }
+        // Gate mutating buttons when we are not connected.
+        const disabled = state === 'disconnected';
+        document.querySelectorAll('[data-mutating="true"]').forEach(btn => {
+            btn.disabled = disabled;
+        });
+    }
+
+    function ensureConnIndicator() {
+        if (document.getElementById('conn-indicator')) return;
+        const dot = document.createElement('span');
+        dot.id = 'conn-indicator';
+        dot.className = 'conn-indicator conn-connecting';
+        dot.title = 'Server: connecting';
+        dot.style.cssText =
+            'display:inline-block;width:10px;height:10px;border-radius:50%;' +
+            'margin:0 8px;vertical-align:middle;background:#888;';
+        const header = document.querySelector('header') || document.body;
+        header.insertBefore(dot, header.firstChild);
+    }
+
+    function markPollOk() {
+        consecutiveFailures = 0;
+        setConnectionState('connected');
+    }
+
+    function markPollFail() {
+        consecutiveFailures += 1;
+        if (consecutiveFailures >= 3) {
+            setConnectionState('disconnected');
+        }
     }
 
     // ═══════════════════════════════════════════════════════════
     //  TOPOLOGY SYNC
     // ═══════════════════════════════════════════════════════════
 
+    // Flush per-node stats when the server reports a new epoch or a restart,
+    // so a stale badge can never outlive the node it described.
+    function reconcileEpoch(data) {
+        if (!data) return;
+        const epoch = data.epoch;
+        const bootId = data.boot_id;
+        if ((serverBootId !== null && bootId !== serverBootId) ||
+            (serverEpoch !== null && epoch !== serverEpoch)) {
+            bundleStats = {};
+        }
+        serverEpoch = epoch;
+        serverBootId = bootId;
+    }
+
     async function fetchTopology() {
         if (importInProgress) return;  // skip while import is running
         try {
-            const res = await fetch('/api/topology');
-            if (res.ok) {
-                topology = await res.json();
-                renderGraph();
-                updateUI();
-                syncTerminals();
-            }
-        } catch (e) { /* retry next poll */ }
+            const data = await apiFetch('/api/topology');
+            reconcileEpoch(data);
+            topology = data;
+            renderGraph();
+            updateUI();
+            syncTerminals();
+            markPollOk();
+        } catch (e) {
+            markPollFail();
+        }
     }
 
     async function syncAfterMutation() {
@@ -107,11 +225,15 @@
     async function fetchBundleStats() {
         if (topology.nodes.length === 0) return;
         try {
-            const res = await fetch('/api/bundle-stats');
-            if (res.ok) {
-                bundleStats = await res.json();
-                renderNodeStats();
+            const data = await apiFetch('/api/bundle-stats');
+            // Keep only stats for nodes that currently exist (drop stale ids).
+            const liveIds = new Set(topology.nodes.map(n => String(n.id)));
+            const filtered = {};
+            for (const [id, v] of Object.entries(data || {})) {
+                if (liveIds.has(String(id))) filtered[id] = v;
             }
+            bundleStats = filtered;
+            renderNodeStats();
         } catch (e) { /* retry next poll */ }
     }
 
@@ -193,25 +315,81 @@
     //  WEBSOCKET — topology (optional, polling is primary)
     // ═══════════════════════════════════════════════════════════
 
+    // One resilient-socket factory: capped exponential backoff + jitter, a
+    // single pending reconnect timer (no leaked timers/handlers), and cleanup
+    // on each (re)connect. The socket OWNS its own reconnection — it is the
+    // single recovery owner, so nothing else recreates it underneath.
+    function makeResilientSocket(url, { onMessage, onOpen, onClose } = {}) {
+        let ws = null;
+        let reconnectTimer = null;
+        let attempt = 0;
+        let closedByUser = false;
+
+        function connect() {
+            if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+            try {
+                ws = new WebSocket(url);
+            } catch (e) {
+                scheduleReconnect();
+                return;
+            }
+            ws.onopen = () => {
+                attempt = 0;
+                if (onOpen) try { onOpen(); } catch (_) {}
+            };
+            ws.onmessage = (evt) => {
+                if (onMessage) try { onMessage(evt); } catch (_) {}
+            };
+            ws.onerror = () => { try { ws.close(); } catch (_) {} };
+            ws.onclose = () => {
+                if (onClose) try { onClose(); } catch (_) {}
+                if (!closedByUser) scheduleReconnect();
+            };
+        }
+
+        function scheduleReconnect() {
+            if (closedByUser || reconnectTimer) return;
+            attempt += 1;
+            // Cap at 30s; add jitter to avoid synchronized reconnect storms.
+            const base = Math.min(30000, 1000 * Math.pow(2, attempt));
+            const delay = base / 2 + Math.random() * (base / 2);
+            reconnectTimer = setTimeout(() => {
+                reconnectTimer = null;
+                connect();
+            }, delay);
+        }
+
+        connect();
+        return {
+            close() {
+                closedByUser = true;
+                if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+                if (ws) try { ws.close(); } catch (_) {}
+            },
+            get readyState() { return ws ? ws.readyState : WebSocket.CLOSED; },
+        };
+    }
+
     function connectWsTopology() {
-        try {
-            const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-            wsTopology = new WebSocket(`${proto}//${location.host}/ws/topology`);
-            wsTopology.onmessage = (evt) => {
-                if (importInProgress) return;  // skip while import is running
-                try {
-                    const msg = JSON.parse(evt.data);
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        wsTopology = makeResilientSocket(
+            `${proto}//${location.host}/ws/topology`,
+            {
+                onMessage: (evt) => {
+                    if (importInProgress) return;  // skip while import is running
+                    let msg;
+                    try { msg = JSON.parse(evt.data); } catch (e) { return; }
                     if (msg.type === 'topology') {
+                        reconcileEpoch(msg.data);
                         topology = msg.data;
                         renderGraph();
                         updateUI();
                         syncTerminals();
+                        markPollOk();
                     }
-                } catch (e) {}
-            };
-            wsTopology.onclose = () => setTimeout(connectWsTopology, 5000);
-            wsTopology.onerror = () => wsTopology.close();
-        } catch (e) {}
+                },
+            }
+        );
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -221,14 +399,11 @@
     function syncTerminals() {
         const currentIds = new Set(topology.nodes.map(n => n.id));
 
-        // Add terminals for new nodes, or reconnect if WebSocket is dead
+        // Add terminals for new nodes. Reconnection is owned by the log socket
+        // itself (makeResilientSocket), so we never recreate it here — doing so
+        // would race the socket's own backoff and leak handlers/timers.
         for (const node of topology.nodes) {
-            const existing = nodeTerminals[node.id];
-            if (!existing) {
-                createTerminal(node.id, node.name);
-            } else if (existing.ws && existing.ws.readyState > WebSocket.OPEN) {
-                // WebSocket is CLOSING (2) or CLOSED (3) — container was replaced
-                destroyTerminal(node.id);
+            if (!nodeTerminals[node.id]) {
                 createTerminal(node.id, node.name);
             }
         }
@@ -267,22 +442,20 @@
         panel.innerHTML = `<div class="log-info">── Terminal for ${name} (ipn:${nodeId}) ──</div>`;
         panelsEl.appendChild(panel);
 
-        // Connect WebSocket for log streaming
-        let ws = null;
-        try {
-            const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-            ws = new WebSocket(`${proto}//${location.host}/ws/logs/${nodeId}`);
-            ws.onmessage = (evt) => {
-                try {
-                    const msg = JSON.parse(evt.data);
+        // Connect a resilient WebSocket for log streaming (self-reconnecting).
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = makeResilientSocket(
+            `${proto}//${location.host}/ws/logs/${nodeId}`,
+            {
+                onMessage: (evt) => {
+                    let msg;
+                    try { msg = JSON.parse(evt.data); } catch (e) { return; }
                     if (msg.type === 'logs') {
                         appendToTerminal(nodeId, msg.lines);
                     }
-                } catch (e) {}
-            };
-            ws.onerror = () => {};
-            ws.onclose = () => {};
-        } catch (e) {}
+                },
+            }
+        );
 
         nodeTerminals[nodeId] = { ws, panelEl: panel, tabEl: tab };
 
@@ -767,34 +940,30 @@
 
             switch (action) {
                 case 'disrupt':
-                    showLoading('Disrupting Link', `Disrupting ${nameA} ↔ ${nameB}...`);
-                    try {
+                    await runMutation(async () => {
+                        showLoading('Disrupting Link', `Disrupting ${nameA} ↔ ${nameB}...`);
                         await apiPost(`/api/links/${linkId}/disrupt`, { loss_percent: 100 });
                         toast(`Link ${nameA} ↔ ${nameB} disrupted`, 'info');
                         await syncAfterMutation();
-                    } catch (err) { toast(`Failed: ${err.message}`, 'error'); }
-                    finally { hideLoading(); }
+                    });
                     break;
                 case 'restore':
-                    showLoading('Restoring Link', `Restoring ${nameA} ↔ ${nameB}...`);
-                    try {
+                    await runMutation(async () => {
+                        showLoading('Restoring Link', `Restoring ${nameA} ↔ ${nameB}...`);
                         await apiPost(`/api/links/${linkId}/restore`);
                         toast(`Link ${nameA} ↔ ${nameB} restored`, 'success');
                         await syncAfterMutation();
-                    } catch (err) { toast(`Failed: ${err.message}`, 'error'); }
-                    finally { hideLoading(); }
+                    });
                     break;
                 case 'delete':
                     if (!confirm(`Delete link ${nameA} ↔ ${nameB}?`)) return;
-                    showLoading('Deleting Link', `Removing ${nameA} ↔ ${nameB}...`);
-                    try {
-                        const res = await fetch(`/api/links/${linkId}`, { method: 'DELETE' });
-                        if (!res.ok) throw new Error((await res.json()).detail);
+                    await runMutation(async () => {
+                        showLoading('Deleting Link', `Removing ${nameA} ↔ ${nameB}...`);
+                        await apiDelete(`/api/links/${linkId}`);
                         toast(`Link ${nameA} ↔ ${nameB} deleted`, 'info');
                         await syncAfterMutation();
                         clearInspector();
-                    } catch (err) { toast(`Failed: ${err.message}`, 'error'); }
-                    finally { hideLoading(); }
+                    });
                     break;
             }
         });
@@ -1116,15 +1285,13 @@
             } else {
                 const a = linkFirst, b = nodeId;
                 exitLinkMode();
-                showLoading('Creating Link', `Connecting N${a} and N${b}...`);
-                try {
+                await runMutation(async () => {
+                    showLoading('Creating Link', `Connecting N${a} and N${b}...`);
                     toast(`Creating link N${a} ↔ N${b}...`, 'info');
                     await apiPost('/api/links', { node_a: a, node_b: b });
                     toast(`Link N${a} ↔ N${b} created`, 'success');
                     await syncAfterMutation();
-                } catch (e) {
-                    toast(`Link failed: ${e.message}`, 'error');
-                } finally { hideLoading(); }
+                });
             }
         }
     }
@@ -1135,58 +1302,51 @@
 
     const App = {
         async addNode() {
-            const btn = document.getElementById('btn-add-node');
-            btn.disabled = true;
-            showLoading('Creating Node', 'Starting ION container...');
-            try {
+            return runMutation(async () => {
+                showLoading('Creating Node', 'Starting ION container...');
                 const node = await apiPost('/api/nodes');
                 updateLoading('Syncing', 'Updating topology...');
                 toast(`${node.name} created`, 'success');
                 await syncAfterMutation();
-            } catch (e) { toast(`Failed: ${e.message}`, 'error'); }
-            finally { hideLoading(); btn.disabled = false; }
+            });
         },
 
         async deleteNode(nodeId) {
-            showLoading('Deleting Node', `Removing N${nodeId}...`);
-            try {
+            return runMutation(async () => {
+                showLoading('Deleting Node', `Removing N${nodeId}...`);
                 await apiDelete(`/api/nodes/${nodeId}`);
                 toast(`N${nodeId} deleted`, 'info');
                 clearInspector();
                 await syncAfterMutation();
-            } catch (e) { toast(`Failed: ${e.message}`, 'error'); }
-            finally { hideLoading(); }
+            });
         },
 
         async deleteLink(linkId) {
-            showLoading('Deleting Link', `Removing ${linkId}...`);
-            try {
+            return runMutation(async () => {
+                showLoading('Deleting Link', `Removing ${linkId}...`);
                 await apiDelete(`/api/links/${linkId}`);
                 toast(`Link ${linkId} deleted`, 'info');
                 clearInspector();
                 await syncAfterMutation();
-            } catch (e) { toast(`Failed: ${e.message}`, 'error'); }
-            finally { hideLoading(); }
+            });
         },
 
         async disruptLink(linkId) {
-            showLoading('Disrupting Link', `Applying netem on ${linkId}...`);
-            try {
+            return runMutation(async () => {
+                showLoading('Disrupting Link', `Applying netem on ${linkId}...`);
                 await apiPost(`/api/links/${linkId}/disrupt`);
                 toast(`Link ${linkId} disrupted`, 'info');
                 await syncAfterMutation();
-            } catch (e) { toast(`Failed: ${e.message}`, 'error'); }
-            finally { hideLoading(); }
+            });
         },
 
         async restoreLink(linkId) {
-            showLoading('Restoring Link', `Removing netem on ${linkId}...`);
-            try {
+            return runMutation(async () => {
+                showLoading('Restoring Link', `Removing netem on ${linkId}...`);
                 await apiPost(`/api/links/${linkId}/restore`);
                 toast(`Link ${linkId} restored`, 'success');
                 await syncAfterMutation();
-            } catch (e) { toast(`Failed: ${e.message}`, 'error'); }
-            finally { hideLoading(); }
+            });
         },
 
         async sendBundles() {
@@ -1195,51 +1355,43 @@
             const msg = document.getElementById('traffic-msg').value || 'hello';
             const count = parseInt(document.getElementById('traffic-count').value) || 1;
             if (!from || !to) { toast('Select source and destination', 'error'); return; }
-            showLoading('Sending Bundles', `N${from} → N${to} (${count} bundle${count > 1 ? 's' : ''})...`);
-            try {
+            return runMutation(async () => {
+                showLoading('Sending Bundles', `N${from} → N${to} (${count} bundle${count > 1 ? 's' : ''})...`);
                 const r = await apiPost('/api/traffic/send', {
                     from_node: from, to_node: to, message: msg, count,
                 });
                 toast(`Sent ${r.sent} bundle(s): N${from} → N${to}`, 'success');
                 setTimeout(fetchTopology, 2000);
-            } catch (e) { toast(`Send failed: ${e.message}`, 'error'); }
-            finally { hideLoading(); }
+            });
         },
 
         async cleanupAll() {
             if (!confirm('Remove ALL nodes and links?')) return;
-            importInProgress = true;
-            showLoading('Cleaning Up', 'Removing all containers and networks...');
-            try {
-                // Destroy terminals before backend cleanup
-                for (const id of Object.keys(nodeTerminals)) {
-                    destroyTerminal(parseInt(id));
-                }
+            return runMutation(async () => {
+                showLoading('Cleaning Up', 'Removing all containers and networks...');
                 await apiPost('/api/cleanup');
                 toast('Cleaned up', 'info');
-                importInProgress = false;
+                // Do NOT optimistically destroy terminals: syncTerminals
+                // reconciles them from the fetched (server-truth) topology.
                 await syncAfterMutation();
                 clearInspector();
-            } catch (e) { toast(`Failed: ${e.message}`, 'error'); }
-            finally { importInProgress = false; hideLoading(); }
+            });
         },
 
         async setExits() {
-            showLoading('Setting Exits', 'Computing shortest-path routes...');
-            try {
+            return runMutation(async () => {
+                showLoading('Setting Exits', 'Computing shortest-path routes...');
                 await apiPost('/api/exits/set');
                 toast('Exit routes set (shortest-path)', 'success');
-            } catch (e) { toast(`Failed: ${e.message}`, 'error'); }
-            finally { hideLoading(); }
+            });
         },
 
         async clearExits() {
-            showLoading('Clearing Exits', 'Removing all exit routes...');
-            try {
+            return runMutation(async () => {
+                showLoading('Clearing Exits', 'Removing all exit routes...');
                 await apiPost('/api/exits/clear');
                 toast('Exit routes cleared', 'success');
-            } catch (e) { toast(`Failed: ${e.message}`, 'error'); }
-            finally { hideLoading(); }
+            });
         },
 
         async addExit(nodeId) {
@@ -1356,14 +1508,19 @@
             }
             showLoading('Exporting Bundle', 'Generating standalone scenario archive...');
             try {
+                // Binary download: keep a raw fetch (blob success path), but
+                // parse the error body defensively so a non-JSON 5xx surfaces
+                // a real message instead of an "Unexpected token <" crash.
                 const res = await fetch('/api/scenarios/export-bundle', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({}),
                 });
                 if (!res.ok) {
-                    const err = await res.json();
-                    throw new Error(err.detail || 'Export failed');
+                    const errText = await res.text();
+                    let detail = `${res.status} ${res.statusText}`;
+                    try { detail = JSON.parse(errText).detail || detail; } catch (_) {}
+                    throw new Error(detail);
                 }
                 // Extract filename from Content-Disposition header
                 const disposition = res.headers.get('Content-Disposition') || '';
@@ -1389,63 +1546,56 @@
         async handleImportFile(file) {
             if (!file) return;
             if (!confirm('This will replace the current topology. Continue?')) return;
+            if (mutationInFlight) { toast('Another operation is in progress…', 'info'); return; }
 
-            // Pause background topology sync to avoid race conditions
-            importInProgress = true;
-            showLoading('Importing Scenario', 'Reading file...');
+            mutationInFlight = true;
+            let savedPositions = null;
             try {
-                // Read file locally to extract positions before uploading
+                // Set the sync-pause flag INSIDE the try so an early throw can
+                // never strand it true (which would freeze poll + WS forever).
+                importInProgress = true;
+                showLoading('Importing Scenario', 'Reading file...');
+
                 const text = await file.text();
-                let savedPositions = null;
                 try {
                     const parsed = JSON.parse(text);
                     savedPositions = parsed.positions || null;
                 } catch (e) {}
-
-                // Store positions so renderGraph uses them for new nodes
                 if (savedPositions) {
                     pendingPositions = { ...savedPositions };
-                }
-
-                // Destroy all existing terminals — containers will be replaced
-                for (const id of Object.keys(nodeTerminals)) {
-                    destroyTerminal(parseInt(id));
                 }
 
                 showLoading('Importing Scenario', 'Creating nodes, links, and exit routes...');
                 const formData = new FormData();
                 formData.append('file', new Blob([text], { type: 'application/json' }), file.name);
-                const res = await fetch('/api/scenarios/import', {
+                const data = await apiFetch('/api/scenarios/import', {
                     method: 'POST',
                     body: formData,
                 });
-                const data = await res.json();
-                if (!res.ok) throw new Error(data.detail || 'Import failed');
                 const exitMsg = data.exits_applied ? `, ${data.exits_applied} exits` : '';
                 toast(`Imported: ${data.nodes_created} nodes, ${data.links_created} links${exitMsg}`, 'success');
 
-                // Resume topology sync BEFORE fetching so the new state is rendered
+                // Resume sync BEFORE fetching so the new state renders. Existing
+                // terminals are reconciled by syncTerminals from server truth —
+                // no optimistic destroy.
                 importInProgress = false;
                 await syncAfterMutation();
 
-                // Apply positions one more time to be sure
                 if (savedPositions && cy) {
                     cy.nodes().forEach(n => {
                         const saved = savedPositions[n.id()];
-                        if (saved) {
-                            n.position({ x: saved.x, y: saved.y });
-                        }
+                        if (saved) n.position({ x: saved.x, y: saved.y });
                     });
                 }
-
-                // Clear pending after a delay (allow a couple poll cycles)
                 setTimeout(() => { pendingPositions = {}; }, 8000);
             } catch (e) {
                 toast(`Import failed: ${e.message}`, 'error');
                 console.error('[Import] Error:', e);
-            }
-            finally {
+                // Reconcile UI to whatever the server actually has.
+                try { await fetchTopology(); } catch (_) {}
+            } finally {
                 importInProgress = false;  // always resume sync
+                mutationInFlight = false;
                 hideLoading();
             }
         },
@@ -1567,6 +1717,14 @@
                 App.handleImportFile(e.target.files[0]);
                 e.target.value = '';  // Reset so same file can be re-imported
             }
+        });
+
+        // Connection indicator + gate mutating buttons on connection health.
+        ensureConnIndicator();
+        ['btn-add-node', 'btn-link-mode', 'btn-send', 'btn-cleanup',
+         'btn-set-exits', 'btn-clear-exits', 'btn-import'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.dataset.mutating = 'true';
         });
 
         // Data sync
