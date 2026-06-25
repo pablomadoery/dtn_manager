@@ -1,5 +1,10 @@
-fastapi[standard]>=0.115.0
-uvicorn[standard]>=0.30.0
-docker>=7.0.0
-websockets>=12.0
-python-multipart>=0.0.6
+# Pinned for reproducibility. The control plane drives privileged containers,
+# so build inputs are pinned to exact versions. For a fully locked-down build,
+# regenerate this with `pip-compile --generate-hashes` and install with
+# `pip install --require-hashes`.
+fastapi[standard]==0.115.6
+uvicorn[standard]==0.34.0
+docker==7.1.0
+websockets==14.1
+python-multipart==0.0.20
+pydantic==2.10.4

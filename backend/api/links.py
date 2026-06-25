@@ -1,18 +1,20 @@
 """Link management API endpoints."""
 
-from fastapi import APIRouter, HTTPException
+import asyncio
+
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from typing import Optional
+
+from backend.api.deps import get_manager
+from backend.services.docker_manager import DockerManager
 
 router = APIRouter(prefix="/api/links", tags=["links"])
-
-# Will be set by main.py
-manager = None
 
 
 class CreateLinkRequest(BaseModel):
     node_a: int
     node_b: int
+    convergence_layer: str = "tcpcl"
 
 
 class DisruptRequest(BaseModel):
@@ -22,54 +24,34 @@ class DisruptRequest(BaseModel):
 
 
 @router.post("")
-def create_link(req: CreateLinkRequest):
-    try:
-        link = manager.create_link(req.node_a, req.node_b)
-        return link.to_dict()
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def create_link(req: CreateLinkRequest,
+                      manager: DockerManager = Depends(get_manager)):
+    link = await asyncio.to_thread(
+        manager.create_link, req.node_a, req.node_b, req.convergence_layer)
+    return link.to_dict()
 
 
 @router.get("")
-def list_links():
+def list_links(manager: DockerManager = Depends(get_manager)):
     return [l.to_dict() for l in manager.list_links()]
 
 
 @router.delete("/{link_id}")
-def delete_link(link_id: str):
-    try:
-        manager.delete_link(link_id)
-        return {"status": "deleted", "link_id": link_id}
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def delete_link(link_id: str, manager: DockerManager = Depends(get_manager)):
+    await asyncio.to_thread(manager.delete_link, link_id)
+    return {"status": "deleted", "link_id": link_id}
 
 
 @router.post("/{link_id}/disrupt")
-def disrupt_link(link_id: str, req: DisruptRequest = DisruptRequest()):
-    try:
-        link = manager.disrupt_link(
-            link_id,
-            loss=req.loss_percent,
-            delay=req.delay_ms,
-            jitter=req.jitter_ms,
-        )
-        return link.to_dict()
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def disrupt_link(link_id: str, req: DisruptRequest = DisruptRequest(),
+                       manager: DockerManager = Depends(get_manager)):
+    link = await asyncio.to_thread(
+        manager.disrupt_link, link_id,
+        req.loss_percent, req.delay_ms, req.jitter_ms)
+    return link.to_dict()
 
 
 @router.post("/{link_id}/restore")
-def restore_link(link_id: str):
-    try:
-        link = manager.restore_link(link_id)
-        return link.to_dict()
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def restore_link(link_id: str, manager: DockerManager = Depends(get_manager)):
+    link = await asyncio.to_thread(manager.restore_link, link_id)
+    return link.to_dict()

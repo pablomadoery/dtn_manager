@@ -1,26 +1,38 @@
 #!/usr/bin/env bash
 #
-# stop.sh -- Stop DTN-Manager and clean up all resources
+# stop.sh -- Stop the DTN-Manager server.
+#
+# By default this stops ONLY the web server and LEAVES the Docker topology
+# running, so a subsequent ./start.sh re-adopts it via reconcile() (resource
+# lifecycle is decoupled from process lifecycle). Pass --teardown to also wipe
+# all managed containers and networks.
 #
 # Usage:
-#   ./stop.sh              Graceful shutdown
-#   ./stop.sh --force      Force-kill and remove all managed containers/networks
+#   ./stop.sh              Stop the server, preserve topology
+#   ./stop.sh --teardown   Stop the server AND remove all managed resources
+#   ./stop.sh --force      Force-kill the server (still preserves unless
+#                          combined with --teardown)
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PID_FILE="${SCRIPT_DIR}/.ionmgr.pid"
-LOG_FILE="${SCRIPT_DIR}/.ionmgr.log"
 FORCE_MODE=false
-LABEL_KEY="ionmgr.managed"
+TEARDOWN=false
+
+# shellcheck source=docker/lib_cleanup.sh
+source "${SCRIPT_DIR}/docker/lib_cleanup.sh"
 
 # -- Parse arguments -----------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --force|-f) FORCE_MODE=true; shift ;;
+        --force|-f)  FORCE_MODE=true; shift ;;
+        --teardown)  TEARDOWN=true; shift ;;
         -h|--help)
-            echo "Usage: $0 [--force]"
-            echo "  --force, -f   Force-kill server and remove all Docker resources"
+            echo "Usage: $0 [--force] [--teardown]"
+            echo "  --force, -f   Force-kill the server process"
+            echo "  --teardown    Also remove all managed containers/networks"
+            echo "                (default: server stops, topology is preserved)"
             exit 0
             ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
@@ -42,7 +54,6 @@ if [[ -f "$PID_FILE" ]]; then
         else
             echo ">>> Sending graceful shutdown to server (PID $PID)..."
             kill -TERM "$PID" 2>/dev/null || true
-            # Wait up to 5 seconds for graceful shutdown
             for i in $(seq 1 5); do
                 if ! kill -0 "$PID" 2>/dev/null; then
                     break
@@ -51,7 +62,6 @@ if [[ -f "$PID_FILE" ]]; then
                 printf "    Waiting... (%d/5)\r" "$i"
             done
             echo ""
-            # Force-kill if still alive
             if kill -0 "$PID" 2>/dev/null; then
                 echo "[!] Graceful shutdown timed out, force-killing..."
                 kill -9 "$PID" 2>/dev/null || true
@@ -66,28 +76,21 @@ else
     echo "[i] No PID file found -- server may not be running"
 fi
 
-# -- Step 2: Clean up Docker resources -----------------------------------------
+# -- Step 2: Resource teardown (opt-in only) ----------------------------------
 echo ""
-echo ">>> Cleaning up Docker resources..."
-
-# Remove managed containers
-CONTAINERS=$(docker ps -aq --filter "label=$LABEL_KEY" 2>/dev/null || true)
-if [[ -n "$CONTAINERS" ]]; then
-    echo "    Removing managed containers..."
-    echo "$CONTAINERS" | xargs docker rm -f 2>/dev/null || true
-    echo "[ok] Containers removed"
+if [[ "$TEARDOWN" == true ]]; then
+    echo ">>> Tearing down managed Docker resources..."
+    if ! ionmgr_docker_ok; then
+        echo "[!] Docker daemon is not reachable -- cleanup could NOT run."
+        echo "    Managed resources may still be present. Re-run ./stop.sh"
+        echo "    --teardown once Docker is available."
+        exit 1
+    fi
+    ionmgr_reap_managed
+    echo "[ok] Managed resources removed"
 else
-    echo "[ok] No managed containers found"
-fi
-
-# Remove managed networks
-NETWORKS=$(docker network ls -q --filter "label=$LABEL_KEY" 2>/dev/null || true)
-if [[ -n "$NETWORKS" ]]; then
-    echo "    Removing managed networks..."
-    echo "$NETWORKS" | xargs docker network rm 2>/dev/null || true
-    echo "[ok] Networks removed"
-else
-    echo "[ok] No managed networks found"
+    echo "[i] Topology preserved (run with --teardown to remove all resources)."
+    echo "    ./start.sh will re-adopt the running topology via reconcile()."
 fi
 
 # -- Done ----------------------------------------------------------------------

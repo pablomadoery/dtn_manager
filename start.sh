@@ -14,16 +14,34 @@ PID_FILE="${SCRIPT_DIR}/.ionmgr.pid"
 LOG_FILE="${SCRIPT_DIR}/.ionmgr.log"
 PORT=8080
 FORCE_REBUILD=false
+CLEAN=false
+
+# Network binding. Default to localhost only: the control plane drives
+# privileged containers and has no auth, so it must never be exposed by
+# default. Opt in to a wider bind with BIND_HOST=0.0.0.0 ./start.sh.
+BIND_HOST="${BIND_HOST:-127.0.0.1}"
+
+# shellcheck source=docker/lib_cleanup.sh
+source "${SCRIPT_DIR}/docker/lib_cleanup.sh"
 
 # -- Parse arguments -----------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -p|--port)   PORT="$2"; shift 2 ;;
         --rebuild)   FORCE_REBUILD=true; shift ;;
+        --clean)     CLEAN=true; shift ;;
         -h|--help)
-            echo "Usage: $0 [-p PORT] [--rebuild]"
+            echo "Usage: $0 [-p PORT] [--rebuild] [--clean]"
             echo "  -p, --port PORT   Server port (default: 8080)"
             echo "  --rebuild         Force-rebuild the Docker image"
+            echo "  --clean           Wipe all managed containers/networks before"
+            echo "                    start (default start PRESERVES topology and"
+            echo "                    re-adopts it via reconcile)"
+            echo ""
+            echo "Env:"
+            echo "  BIND_HOST   Interface to bind (default 127.0.0.1; set to"
+            echo "              0.0.0.0 to expose — UNAUTHENTICATED, localhost only"
+            echo "              is strongly recommended)"
             exit 0
             ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
@@ -36,7 +54,9 @@ echo "|          DTN-Manager -- Deployment                |"
 echo "+==================================================+"
 echo ""
 
-# Check if already running
+# Check if already running. LIVE_INSTANCE gates the orphan prune below — we
+# must never reap resources out from under a still-running manager.
+LIVE_INSTANCE=false
 if [[ -f "$PID_FILE" ]]; then
     OLD_PID=$(cat "$PID_FILE")
     if kill -0 "$OLD_PID" 2>/dev/null; then
@@ -61,6 +81,22 @@ if ! docker info &>/dev/null; then
     exit 1
 fi
 echo "[ok] Docker is available"
+
+# -- Orphan handling ----------------------------------------------------------
+# Only safe because we already confirmed no live owned instance above.
+if [[ "$CLEAN" == true ]]; then
+    echo ""
+    echo ">>> --clean: wiping all managed Docker resources..."
+    ionmgr_reap_managed || true
+    echo "[ok] Clean slate"
+else
+    # Default start PRESERVES topology: the manager's reconcile() re-adopts
+    # healthy resources at startup. We only reap true crash leftovers here as a
+    # belt-and-suspenders for the case where the manager has not yet started —
+    # reconcile then adopts what survives. (No blanket prune: that would defeat
+    # preservation. The in-app reconcile is the primary adopter.)
+    :
+fi
 
 # Check Python
 if ! command -v python3 &>/dev/null; then
@@ -93,10 +129,15 @@ echo "[ok] Scenarios directory ready"
 
 # -- Step 4: Start the server --------------------------------------------------
 echo ""
-echo ">>> Starting server on port $PORT..."
+echo ">>> Starting server on ${BIND_HOST}:${PORT}..."
+if [[ "$BIND_HOST" != "127.0.0.1" && "$BIND_HOST" != "localhost" ]]; then
+    echo "[!] WARNING: binding to ${BIND_HOST} exposes an UNAUTHENTICATED"
+    echo "    control plane that drives privileged containers. Only do this on"
+    echo "    a trusted, isolated network."
+fi
 cd "$SCRIPT_DIR"
 nohup python3 -m uvicorn backend.main:app \
-    --host 0.0.0.0 \
+    --host "$BIND_HOST" \
     --port "$PORT" \
     > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
