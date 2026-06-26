@@ -1,13 +1,14 @@
 """Traffic management API endpoints."""
 
-from fastapi import APIRouter, HTTPException
+import asyncio
+
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from typing import Optional
+
+from backend.api.deps import get_manager
+from backend.services.docker_manager import DockerManager
 
 router = APIRouter(prefix="/api/traffic", tags=["traffic"])
-
-# Will be set by main.py
-manager = None
 
 
 class SendBundleRequest(BaseModel):
@@ -18,20 +19,19 @@ class SendBundleRequest(BaseModel):
 
 
 @router.post("/send")
-def send_bundles(req: SendBundleRequest):
-    try:
+async def send_bundles(req: SendBundleRequest,
+                       manager: DockerManager = Depends(get_manager)):
+    def _send_all():
         results = []
         for i in range(req.count):
             msg = f"{req.message} #{i+1}" if req.count > 1 else req.message
-            ok = manager.send_bundle(req.from_node, req.to_node, msg)
-            results.append(ok)
-        return {
-            "from_node": req.from_node,
-            "to_node": req.to_node,
-            "sent": sum(results),
-            "failed": len(results) - sum(results),
-        }
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            results.append(manager.send_bundle(req.from_node, req.to_node, msg))
+        return results
+
+    results = await asyncio.to_thread(_send_all)
+    return {
+        "from_node": req.from_node,
+        "to_node": req.to_node,
+        "sent": sum(results),
+        "failed": len(results) - sum(results),
+    }

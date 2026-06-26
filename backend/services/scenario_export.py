@@ -54,24 +54,35 @@ def generate_dockerfile() -> str:
 
         ENV DEBIAN_FRONTEND=noninteractive
 
+        # ION-DTN source pin — reproducible build, no "clone git HEAD" risk.
+        # Override with: docker build --build-arg ION_REF=<tag-or-commit> ...
+        ARG ION_REF=ion-open-source-4.1.3
+
         # Install build dependencies and runtime tools
-        RUN apt-get update && apt-get install -y \\
+        RUN apt-get update && apt-get install -y --no-install-recommends \\
             build-essential git automake autoconf libtool \\
-            iproute2 bash iputils-ping procps \\
+            iproute2 bash iputils-ping procps ca-certificates \\
             && rm -rf /var/lib/apt/lists/*
 
-        # Clone and build ION-DTN from source
+        # Clone and build ION-DTN from the pinned ref
         RUN git clone https://github.com/nasa-jpl/ION-DTN.git /opt/ion && \\
             cd /opt/ion && \\
+            git checkout "${ION_REF}" && \\
             autoreconf -fi && \\
             ./configure && \\
-            make -j$(nproc) && \\
+            make -j"$(nproc)" && \\
             make install && \\
             ldconfig && \\
             rm -rf /opt/ion
 
+        LABEL ion.ref="${ION_REF}"
+
         # Default working directory for ION runtime files (ion.log, SDR, etc.)
         WORKDIR /ion-runtime
+
+        # ION is healthy only when bpadmin responds.
+        HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \\
+            CMD echo 'l' | bpadmin >/dev/null 2>&1 || exit 1
 
         # Keep container alive
         CMD ["tail", "-f", "/dev/null"]
@@ -136,9 +147,18 @@ def generate_node_rc(
 
     Args:
         node_id: IPN node number
-        neighbors: List of dicts with keys peer_id, peer_ip
+        neighbors: List of dicts with keys peer_id, peer_ip and optional
+            convergence_layer (defaults to tcp).
         exits: List of dicts with keys dest_first, dest_last, gateway_id
     """
+    from backend.services.ion_config import resolve_cl
+
+    # Distinct CLs across this node's neighbors (always declare tcp baseline).
+    cls = {"tcp": resolve_cl("tcp")}
+    for nb in neighbors:
+        cl = resolve_cl(nb.get("convergence_layer"))
+        cls[cl.token] = cl
+
     lines = []
 
     # ionadmin
@@ -164,10 +184,12 @@ def generate_node_rc(
     lines.append(f"a endpoint ipn:{node_id}.0 q")
     lines.append(f"a endpoint ipn:{node_id}.1 q")
     lines.append(f"a endpoint ipn:{node_id}.2 q")
-    lines.append(f"a protocol tcp 1400 100")
-    lines.append(f"a induct tcp 0.0.0.0:4556 tcpcli")
+    for cl in cls.values():
+        lines.append(f"a protocol {cl.token} 1400 100")
+        lines.append(f"a induct {cl.token} 0.0.0.0:{cl.port} {cl.cli}")
     for nb in neighbors:
-        lines.append(f"a outduct tcp {nb['peer_ip']}:4556 tcpclo")
+        cl = resolve_cl(nb.get("convergence_layer"))
+        lines.append(f"a outduct {cl.token} {nb['peer_ip']}:{cl.port} {cl.clo}")
     lines.append(f"s")
     lines.append(f"## end bpadmin")
     lines.append(f"")
@@ -175,7 +197,8 @@ def generate_node_rc(
     # ipnadmin — egress plans + exit routes
     lines.append(f"## begin ipnadmin")
     for nb in neighbors:
-        lines.append(f"a plan {nb['peer_id']} tcp/{nb['peer_ip']}:4556")
+        cl = resolve_cl(nb.get("convergence_layer"))
+        lines.append(f"a plan {nb['peer_id']} {cl.token}/{nb['peer_ip']}:{cl.port}")
     for ex in exits:
         lines.append(
             f"a exit {ex['dest_first']} {ex['dest_last']} ipn:{ex['gateway_id']}.0"
@@ -277,22 +300,19 @@ def generate_start_script(scenario_name: str, nodes: list[dict]) -> str:
         echo ""
 
         # ── Pre-deploy cleanup ──────────────────────────────────────
-        # Remove any leftover containers and networks from previous
-        # scenario runs that may occupy the 10.40.x.0/24 subnets.
-        echo "Cleaning up previous scenario resources..."
+        # Idempotent teardown by compose PROJECT IDENTITY first: compose.yml
+        # carries `name: {scenario_name}`, so this removes the exact containers
+        # and networks this project owns regardless of subnet state — fixing the
+        # "network already exists" collision that name/subnet matching missed.
+        echo "Cleaning up previous run of this scenario..."
+        docker compose down --remove-orphans >/dev/null 2>&1 || true
 
-        # Stop and remove containers from any old scenario
-        OLD_CONTAINERS=$(docker ps -a --filter "name=scenario_" --format '{{{{.Names}}}}' 2>/dev/null)
-        if [ -n "$OLD_CONTAINERS" ]; then
-            echo "$OLD_CONTAINERS" | xargs -r docker rm -f >/dev/null 2>&1
-            echo "  Removed old containers"
-        fi
-
-        # Remove networks that use the 10.40.x.0/24 subnet range
+        # Secondary net: sweep any orphaned bridge still holding a 10.40.x.0/24
+        # subnet from an abnormally-terminated prior run.
         for net in $(docker network ls --filter "driver=bridge" --format '{{{{.Name}}}}' 2>/dev/null); do
             SUBNET=$(docker network inspect "$net" --format '{{{{range .IPAM.Config}}}}{{{{.Subnet}}}}{{{{end}}}}' 2>/dev/null)
             if echo "$SUBNET" | grep -q "^10\\.40\\." 2>/dev/null; then
-                docker network rm "$net" >/dev/null 2>&1 && echo "  Removed network $net ($SUBNET)"
+                docker network rm "$net" >/dev/null 2>&1 && echo "  Removed orphan network $net ($SUBNET)"
             fi
         done
 
@@ -351,7 +371,16 @@ def generate_stop_script(scenario_name: str) -> str:
 
         echo "=== Stopping {scenario_name} Scenario ==="
 
+        # Teardown by compose project identity (name: {scenario_name}).
         docker compose down --volumes --remove-orphans
+
+        # Secondary net: reap any orphaned 10.40.x.0/24 bridge a crashed run left.
+        for net in $(docker network ls --filter "driver=bridge" --format '{{{{.Name}}}}' 2>/dev/null); do
+            SUBNET=$(docker network inspect "$net" --format '{{{{range .IPAM.Config}}}}{{{{.Subnet}}}}{{{{end}}}}' 2>/dev/null)
+            if echo "$SUBNET" | grep -q "^10\\.40\\." 2>/dev/null; then
+                docker network rm "$net" >/dev/null 2>&1 && echo "  Removed orphan network $net"
+            fi
+        done
 
         echo "✔ Scenario stopped (containers, networks, and volumes removed)"
     """)
@@ -783,6 +812,7 @@ def build_export_archive(
         links_raw.append({
             "node_a": link.node_a,
             "node_b": link.node_b,
+            "convergence_layer": link.convergence_layer,
         })
     links_data = _sorted_links(links_raw)
 
@@ -798,13 +828,16 @@ def build_export_archive(
     node_neighbors: dict[int, list[dict]] = {n["id"]: [] for n in nodes_data}
     for idx, link in enumerate(links_data):
         subnet, ip_a, ip_b, net_name = link_map[idx]
+        cl = link.get("convergence_layer", "tcpcl")
         node_neighbors[link["node_a"]].append({
             "peer_id": link["node_b"],
             "peer_ip": ip_b,
+            "convergence_layer": cl,
         })
         node_neighbors[link["node_b"]].append({
             "peer_id": link["node_a"],
             "peer_ip": ip_a,
+            "convergence_layer": cl,
         })
 
     # Collect live exit routes from each node

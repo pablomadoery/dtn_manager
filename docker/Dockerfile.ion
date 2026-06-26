@@ -1,25 +1,43 @@
+# Pin the base image by tag (ideally pin by digest in a locked-down build).
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install build dependencies and runtime tools
-RUN apt-get update && apt-get install -y \
+# ION-DTN source pin. Override at build time with:
+#   docker build --build-arg ION_REF=<tag-or-commit> ...
+# Pinning a specific ref makes the image reproducible and removes the
+# "clone git HEAD" supply-chain risk. Verify the ref against upstream before
+# bumping it.
+ARG ION_REF=ion-open-source-4.1.3
+
+# Install build dependencies and runtime tools.
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential git automake autoconf libtool \
-    iproute2 bash iputils-ping procps \
+    iproute2 bash iputils-ping procps ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone and build ION-DTN from source
+# Clone and build ION-DTN from the pinned ref. The build fails loudly if the
+# requested ref cannot be checked out.
 RUN git clone https://github.com/nasa-jpl/ION-DTN.git /opt/ion && \
     cd /opt/ion && \
+    git checkout "${ION_REF}" && \
     autoreconf -fi && \
     ./configure && \
-    make -j$(nproc) && \
+    make -j"$(nproc)" && \
     make install && \
     ldconfig && \
     rm -rf /opt/ion
 
+# Record the provenance of this image for staleness detection.
+LABEL ion.ref="${ION_REF}"
+
 # Default working directory for ION runtime files (ion.log, SDR, etc.)
 WORKDIR /ion-runtime
+
+# Liveness probe: ION is healthy only when bpadmin responds. Containers that
+# fail ionstart (entrypoint exits 1) are reported unhealthy/exited, not running.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
+    CMD echo 'l' | bpadmin >/dev/null 2>&1 || exit 1
 
 # Keep container alive
 CMD ["tail", "-f", "/dev/null"]

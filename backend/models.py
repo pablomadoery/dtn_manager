@@ -16,6 +16,7 @@ class LinkStatus(str, Enum):
     UP = "up"
     DOWN = "down"
     DEGRADED = "degraded"
+    ERROR = "error"  # half-built / readiness-gated link (reconcile can repair)
 
 
 @dataclass
